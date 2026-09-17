@@ -20,7 +20,14 @@ jobs:
       - name: Установить Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          # flet-cli 1.0.0 требует ровно эту версию Flutter. Если поставить
+          # channel: stable, actions/flutter-action подтянет более свежую
+          # версию, flet её не примет и попытается сам доустановить нужную —
+          # с интерактивным вопросом "Proceed? [y/n]", на который у CI нет
+          # ввода, и сборка падает с EOFError. Версию нужно свериться с тем,
+          # что просит лог сборки (строка "Flutter SDK N.N.N is required"),
+          # и поменять здесь, если flet после обновления захочет другую.
+          flutter-version: '3.44.8'
 
       - name: Принять лицензии Android SDK
         run: yes | sdkmanager --licenses || true
@@ -45,7 +52,14 @@ jobs:
           fi
 
       - name: Собрать APK
-        run: flet build apk --verbose
+        # flet сам обнаруживает, что Flutter на PATH не той версии, и
+        # предлагает установить нужную версию сам себе — с вопросом
+        # "Proceed? [y/n]", на который у GitHub Actions нет интерактивного
+        # ввода, и сборка падает с EOFError. "yes |" отвечает "y" на любой
+        # такой вопрос автоматически, так что flet ставит нужную версию
+        # сам — независимо от того, что установил шаг "Установить Flutter"
+        # выше по PATH.
+        run: yes | flet build apk --verbose
 
       - name: Выложить APK
         uses: actions/upload-artifact@v4
