@@ -24,6 +24,8 @@ import datetime
 import json
 import os
 import re
+import inspect
+import shutil
 from urllib.parse import quote
 
 import flet as ft
@@ -298,6 +300,8 @@ DB_EXTRA_COLUMNS = [
     "network_gen", "form_factor", "compat_class",
     "imei2_rule_type", "imei2_rule_param",
 ]
+DB_DEVICE_COLUMNS_WHITELIST = ["tac", "brand", "specs"] + DB_EXTRA_COLUMNS
+DB_PAIRS_COLUMNS_WHITELIST = ["tac", "partner_tac", "form"]
 
 
 class BundledBase:
@@ -436,6 +440,85 @@ class BundledBase:
         except Exception:
             return 0
 
+    def close(self):
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+
+
+def merge_database_file(new_path, dest_path):
+    """Вливает файл new_path в рабочую базу dest_path, не стирая то, что там
+    уже было: TAC, которых не было — добавляются; TAC, которые уже были —
+    обновляются данными из нового файла (он считается более свежим).
+    Если рабочей базы ещё нет — новый файл становится ею целиком, это
+    просто копирование, без построчной вставки.
+
+    Список разрешённых колонок (DB_DEVICE_COLUMNS_WHITELIST /
+    DB_PAIRS_COLUMNS_WHITELIST) — это подстраховка при формировании SQL:
+    имена колонок туда никогда не приходят от пользователя напрямую, но
+    так спокойнее.
+
+    Возвращает (added, updated, pairs_added) или бросает исключение с
+    понятным текстом, если файл не похож на такую же базу."""
+    if sqlite3 is None:
+        raise RuntimeError("в этой сборке нет модуля sqlite3")
+    if not os.path.isfile(dest_path):
+        shutil.copyfile(new_path, dest_path)
+        total = sqlite3.connect(new_path).execute("SELECT COUNT(*) FROM tac_devices").fetchone()[0]
+        return total, 0, 0
+
+    conn = sqlite3.connect(dest_path)
+    try:
+        conn.execute("ATTACH DATABASE ? AS newdb", (new_path,))
+
+        dest_cols = [r[1] for r in conn.execute("PRAGMA table_info(tac_devices)")]
+        new_cols = [r[1] for r in conn.execute("PRAGMA newdb.table_info(tac_devices)")]
+        if "tac" not in new_cols:
+            raise ValueError("в выбранном файле нет таблицы tac_devices с колонкой tac")
+        common = [c for c in DB_DEVICE_COLUMNS_WHITELIST if c in dest_cols and c in new_cols]
+        collist = ", ".join(common)
+
+        before = conn.execute("SELECT COUNT(*) FROM tac_devices").fetchone()[0]
+        overlap = conn.execute(
+            "SELECT COUNT(*) FROM newdb.tac_devices WHERE tac IN (SELECT tac FROM tac_devices)"
+        ).fetchone()[0]
+        conn.execute("INSERT OR REPLACE INTO tac_devices (%s) SELECT %s FROM newdb.tac_devices"
+                     % (collist, collist))
+
+        pairs_added = 0
+        has_pairs_new = bool(list(conn.execute(
+            "SELECT name FROM newdb.sqlite_master WHERE type='table' AND name='tac_pairs_lib'")))
+        if has_pairs_new:
+            has_pairs_dest = bool(list(conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='tac_pairs_lib'")))
+            if not has_pairs_dest:
+                conn.execute("CREATE TABLE tac_pairs_lib "
+                            "(tac TEXT PRIMARY KEY, partner_tac TEXT NOT NULL, form TEXT)")
+            new_pcols = [r[1] for r in conn.execute("PRAGMA newdb.table_info(tac_pairs_lib)")]
+            dest_pcols = [r[1] for r in conn.execute("PRAGMA table_info(tac_pairs_lib)")]
+            pcommon = [c for c in DB_PAIRS_COLUMNS_WHITELIST if c in dest_pcols and c in new_pcols]
+            if "tac" in pcommon:
+                pcollist = ", ".join(pcommon)
+                pairs_added = conn.execute("SELECT COUNT(*) FROM newdb.tac_pairs_lib").fetchone()[0]
+                conn.execute("INSERT OR REPLACE INTO tac_pairs_lib (%s) SELECT %s FROM newdb.tac_pairs_lib"
+                             % (pcollist, pcollist))
+
+        conn.commit()
+        after = conn.execute("SELECT COUNT(*) FROM tac_devices").fetchone()[0]
+    finally:
+        try:
+            conn.execute("DETACH DATABASE newdb")
+        except Exception:
+            pass
+        conn.close()
+
+    added = after - before
+    updated = overlap
+    return added, updated, pairs_added
+
 
 # ==========================================================================
 #                              ХРАНИЛИЩЕ
@@ -532,6 +615,87 @@ async def main(page: ft.Page):
         "image_cache": {}, # TAC -> URL фото или "" (уже искали — не нашлось)
     }
     base = BundledBase()
+    file_picker = ft.FilePicker()
+    page.overlay.append(file_picker)
+
+    async def import_database(e=None):
+        """Вливает выбранный .db-файл в базу приложения, не стирая то, что
+        там уже было — новые модели добавляются, уже известные обновляются.
+        Работает без пересборки APK: скачал файл на телефон любым способом
+        (Telegram, Google Диск, кабель) и указал его здесь."""
+        nonlocal base
+        path = None
+        last_err = None
+        for name in ("pick_files_async", "pick_files"):
+            fn = getattr(file_picker, name, None)
+            if fn is None:
+                continue
+            try:
+                result = fn(allow_multiple=False, allowed_extensions=["db", "sqlite", "sqlite3"])
+            except TypeError:
+                try:
+                    result = fn()
+                except Exception as ex:
+                    last_err = ex
+                    continue
+            except Exception as ex:
+                last_err = ex
+                continue
+            if inspect.isawaitable(result):
+                try:
+                    result = await result
+                except Exception as ex:
+                    last_err = ex
+                    continue
+            # Результат бывает по-разному оформлен в зависимости от сборки
+            # Flet: то список файлов напрямую, то объект с атрибутом .files,
+            # то результат нужно брать отдельно из file_picker.result.
+            files = None
+            if isinstance(result, list):
+                files = result
+            elif result is not None and getattr(result, "files", None):
+                files = result.files
+            if not files:
+                fallback = getattr(file_picker, "result", None)
+                if isinstance(fallback, list):
+                    files = fallback
+                elif fallback is not None and getattr(fallback, "files", None):
+                    files = fallback.files
+            picked = files[0] if files else None
+            path = getattr(picked, "path", None) if picked is not None else None
+            if path:
+                break
+        if not path:
+            if last_err:
+                snack("Не удалось открыть выбор файла: " + str(last_err))
+            else:
+                snack("Файл не выбран")
+            return
+        try:
+            os.makedirs(APP_DATA_DIR, exist_ok=True)
+            dest = os.path.join(APP_DATA_DIR, "tac_database.db")
+            # Закрываем текущее соединение перед записью в тот же файл —
+            # иначе запись может конфликтовать с открытым read-only курсором.
+            base.close()
+            added, updated, pairs_added = merge_database_file(path, dest)
+        except Exception as ex:
+            snack("Не удалось объединить базы: " + str(ex))
+            base = BundledBase()
+            render()
+            return
+        base = BundledBase()
+        if base.available:
+            parts = ["новых моделей: %s" % fmt_count(added)]
+            if updated:
+                parts.append("обновлено: %s" % fmt_count(updated))
+            if pairs_added:
+                parts.append("TAC-пар: %s" % fmt_count(pairs_added))
+            snack("Добавлено — " + ", ".join(parts) + ". Всего в базе: %s"
+                  % fmt_count(base.count()))
+        else:
+            snack("Файл обработан, но база не распознана (%s)"
+                  % (base.error or "неизвестная ошибка"))
+        render()
 
     # Поиск модели: сначала то, что пользователь завёл или поправил сам
     # (его правка должна побеждать вшитую базу), затем большая база из сборки.
@@ -1141,16 +1305,27 @@ async def main(page: ft.Page):
             ))
         return chips
 
+    def db_status_icon():
+        return ft.IconButton(
+            ft.Icons.CLOUD_DONE if base.available else ft.Icons.CLOUD_OFF,
+            icon_color=SUCCESS if base.available else WARNING,
+            tooltip=("База подключена: %s моделей" % fmt_count(base.count()))
+                    if base.available else "База не найдена — нажмите, чтобы указать файл",
+            on_click=import_database,
+        )
+
     def render():
         body.controls.clear()
         body.controls.append(TABS[state["tab"]][2]())
         tabs_row.controls = build_tabs_row()
+        page.appbar.actions = [db_status_icon()]
         page.update()
 
     page.appbar = ft.AppBar(
         title=ft.Text("IMEI-помощник"),
         bgcolor=BG_PANEL,
         color=TEXT_MAIN,
+        actions=[db_status_icon()],
     )
     page.add(
         ft.Container(content=tabs_row, padding=ft.Padding.only(left=14, right=14, top=12)),
