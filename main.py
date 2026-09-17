@@ -616,7 +616,7 @@ async def main(page: ft.Page):
     }
     base = BundledBase()
     file_picker = ft.FilePicker()
-    page.overlay.append(file_picker)
+    page.services.append(file_picker)
 
     async def import_database(e=None):
         """Вливает выбранный .db-файл в базу приложения, не стирая то, что
