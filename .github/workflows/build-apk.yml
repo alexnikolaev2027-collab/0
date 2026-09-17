@@ -1,0 +1,55 @@
+name: Собрать APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:      # позволяет запускать сборку вручную кнопкой
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Забрать код
+        uses: actions/checkout@v4
+        with:
+          # lfs: true нужен, если база tac_database.db хранится через Git LFS
+          # (см. README — для файлов больше 100 МБ это обязательно).
+          lfs: true
+
+      - name: Установить Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Принять лицензии Android SDK
+        run: yes | sdkmanager --licenses || true
+
+      - name: Установить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Установить flet
+        run: pip install flet
+
+      - name: Проверить, что база на месте
+        # Если файл базы не попал в репозиторий, приложение соберётся, но
+        # модели определяться не будут. Лучше узнать об этом здесь, а не
+        # после установки APK на телефон.
+        run: |
+          if [ -f tac_database.db ]; then
+            echo "База найдена: $(du -h tac_database.db | cut -f1)"
+          else
+            echo "::warning::tac_database.db не найден — приложение соберётся без встроенной базы"
+          fi
+
+      - name: Собрать APK
+        run: flet build apk --verbose
+
+      - name: Выложить APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: imei-helper-apk
+          path: build/apk/*.apk
+          if-no-files-found: error
