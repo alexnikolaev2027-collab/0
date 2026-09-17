@@ -1,0 +1,25 @@
+[project]
+name = "imei-helper"
+version = "1.0.0"
+description = "IMEI-помощник: модель по TAC и подбор второго IMEI"
+requires-python = ">=3.9"
+
+# Зависимости, которые flet build ставит внутрь приложения.
+# openpyxl здесь НЕ нужен — Excel это приложение не создаёт,
+# а лишняя зависимость только утяжеляет сборку.
+# httpx уже тянется вместе с flet как его собственная зависимость,
+# но указан явно — приложение использует его само (поиск фото модели).
+dependencies = [
+    "flet",
+    "httpx",
+]
+
+[tool.flet]
+org = "com.imeihelper"
+product = "IMEI-помощник"
+company = "IMEI Helper"
+copyright = ""
+
+# Точка входа. Файл main.py должен лежать в корне репозитория.
+[tool.flet.app]
+path = "."
